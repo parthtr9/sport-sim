@@ -773,16 +773,6 @@ def simulate_market(
             market_probability=market["market_probability"],
             linked_headlines=[news["headline"] for news in news_items],
             prior_reactions=prior_reactions,
-            rule_score=rule_score,
-            topics=topics,
-            signals=signals,
-            agent_count=agent_count,
-            randomness=randomness,
-            seed=seed,
-            market_name=market["name"],
-            market_description=market["description"],
-            market_probability=market["market_probability"],
-            linked_headlines=[news["headline"] for news in news_items],
         )
     else:
         result = _simulate_from_components(
