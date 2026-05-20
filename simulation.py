@@ -392,6 +392,18 @@ def _round_memory(reaction: AgentReaction) -> str:
     return f"Prior stance {reaction.sentiment:+.2f}. {reaction.narrative}"
 
 
+def _reaction_to_dict(reaction: AgentReaction) -> dict[str, Any]:
+    """Convert an AgentReaction to a JSON-serializable dict for persistence."""
+    return {
+        "name": reaction.name,
+        "role": reaction.role,
+        "sentiment": reaction.sentiment,
+        "narrative": reaction.narrative,
+        "confidence": reaction.confidence,
+        "source": reaction.source,
+    }
+
+
 def _simulate_with_llm_agents(
     *,
     event_text: str,
@@ -407,7 +419,13 @@ def _simulate_with_llm_agents(
     market_probability: float,
     linked_headlines: list[str],
     openai_api_key: str | None = None,
+    prior_reactions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Simulate market with LLM agents, optionally using prior reactions for delta reasoning.
+    
+    If prior_reactions are provided, agents skip round 1 and do delta-reasoning in round 2,
+    significantly reducing LLM token usage and making reactions deterministic.
+    """
     rng = random.Random(seed)
     chosen_templates = list(select_templates(agent_count, rng))
     clear_last_llm_error()
@@ -420,35 +438,74 @@ def _simulate_with_llm_agents(
         for index, template in enumerate(chosen_templates, start=1)
     ]
 
-    round_one_rows = get_agent_round_llm(
-        personas=personas,
-        event_text=event_text,
-        market_name=market_name,
-        market_description=market_description,
-        market_probability=market_probability,
-        topics=topics,
-        hybrid_score=event_score,
-        linked_headlines=linked_headlines,
-        round_index=1,
-        api_key=openai_api_key,
-    )
-    llm_error = get_last_llm_error()
-
-    if round_one_rows is None:
-        final_reactions = [
-            _simulate_persona_reaction(
-                template=template,
-                index=index,
-                topics=topics,
-                event_score=event_score,
-                randomness=randomness,
-                rng=rng,
-                confidence=0.55,
-                source="heuristic-fallback",
+    # ── If prior reactions exist, skip round 1 and do delta reasoning ──────
+    if prior_reactions is not None:
+        round_one_reactions = [
+            AgentReaction(
+                name=reaction["name"],
+                role=reaction.get("role", ""),
+                sentiment=clamp(float(reaction["sentiment"]), -1.0, 1.0),
+                narrative=reaction["narrative"],
+                confidence=reaction.get("confidence", 0.8),
+                source="prior",
             )
-            for index, template in enumerate(chosen_templates, start=1)
+            for reaction in prior_reactions
         ]
     else:
+        round_one_rows = get_agent_round_llm(
+            personas=personas,
+            event_text=event_text,
+            market_name=market_name,
+            market_description=market_description,
+            market_probability=market_probability,
+            topics=topics,
+            hybrid_score=event_score,
+            linked_headlines=linked_headlines,
+            round_index=1,
+            api_key=openai_api_key,
+        )
+        llm_error = get_last_llm_error()
+
+        if round_one_rows is None:
+            final_reactions = [
+                _simulate_persona_reaction(
+                    template=template,
+                    index=index,
+                    topics=topics,
+                    event_score=event_score,
+                    randomness=randomness,
+                    rng=rng,
+                    confidence=0.55,
+                    source="heuristic-fallback",
+                )
+                for index, template in enumerate(chosen_templates, start=1)
+            ]
+            return {
+                "event_text": event_text,
+                "topics": topics,
+                "signals": signals,
+                "event_score": event_score,
+                "hybrid_score": event_score,
+                "rule_score": rule_score,
+                "agents": final_reactions,
+                "aggregate_sentiment": clamp(
+                    sum(r.sentiment for r in final_reactions) / max(len(final_reactions), 1),
+                    -0.49,
+                    0.49,
+                ),
+                "model_probability": clamp(
+                    0.5 + clamp(
+                        sum(r.sentiment for r in final_reactions) / max(len(final_reactions), 1),
+                        -0.49,
+                        0.49,
+                    ),
+                    0.0,
+                    1.0,
+                ),
+                "agent_backend": "heuristic_fallback",
+                "llm_error": llm_error,
+            }
+
         round_one_reactions = [
             AgentReaction(
                 name=row["name"],
@@ -460,43 +517,45 @@ def _simulate_with_llm_agents(
             )
             for template, row in zip(chosen_templates, round_one_rows)
         ]
-        peer_summary = summarize_agent_round(
-            [{"name": reaction.name, "sentiment": reaction.sentiment} for reaction in round_one_reactions]
-        )
-        prior_memories = {
-            reaction.name: _round_memory(reaction)
-            for reaction in round_one_reactions
-        }
-        round_two_rows = get_agent_round_llm(
-            personas=personas,
-            event_text=event_text,
-            market_name=market_name,
-            market_description=market_description,
-            market_probability=market_probability,
-            topics=topics,
-            hybrid_score=event_score,
-            linked_headlines=linked_headlines,
-            round_index=2,
-            prior_memories=prior_memories,
-            peer_summary=peer_summary,
-            api_key=openai_api_key,
-        )
+
+    # ── Round 2: Delta reasoning with prior context ─────────────────────
+    peer_summary = summarize_agent_round(
+        [{"name": reaction.name, "sentiment": reaction.sentiment} for reaction in round_one_reactions]
+    )
+    prior_memories = {
+        reaction.name: _round_memory(reaction)
+        for reaction in round_one_reactions
+    }
+    round_two_rows = get_agent_round_llm(
+        personas=personas,
+        event_text=event_text,
+        market_name=market_name,
+        market_description=market_description,
+        market_probability=market_probability,
+        topics=topics,
+        hybrid_score=event_score,
+        linked_headlines=linked_headlines,
+        round_index=2,
+        prior_memories=prior_memories,
+        peer_summary=peer_summary,
+        api_key=openai_api_key,
+    )
+    llm_error = get_last_llm_error()
+    if round_two_rows is None:
+        final_reactions = round_one_reactions
+    else:
+        final_reactions = [
+            AgentReaction(
+                name=row["name"],
+                role=template.role,
+                sentiment=clamp(float(row["sentiment"]), -1.0, 1.0),
+                narrative=str(row["narrative"]).strip(),
+                confidence=clamp(float(row["confidence"]), 0.0, 1.0),
+                source=row.get("source", "llm"),
+            )
+            for template, row in zip(chosen_templates, round_two_rows)
+        ]
         llm_error = get_last_llm_error()
-        if round_two_rows is None:
-            final_reactions = round_one_reactions
-        else:
-            final_reactions = [
-                AgentReaction(
-                    name=row["name"],
-                    role=template.role,
-                    sentiment=clamp(float(row["sentiment"]), -1.0, 1.0),
-                    narrative=str(row["narrative"]).strip(),
-                    confidence=clamp(float(row["confidence"]), 0.0, 1.0),
-                    source=row.get("source", "llm"),
-                )
-                for template, row in zip(chosen_templates, round_two_rows)
-            ]
-            llm_error = get_last_llm_error()
 
     aggregate_sentiment = clamp(
         sum(reaction.sentiment for reaction in final_reactions) / max(len(final_reactions), 1),
@@ -689,11 +748,13 @@ def simulate_market(
     seed: int = 7,
     threshold: float = 0.05,
     mode: str = "heuristic",
+    prior_reactions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run the full agent simulation for a single market.
 
     *news_items* should be only the news linked to this market.
     *news_edges* should be only the news→market edges for this market.
+    *prior_reactions* optional saved reactions from a previous news event to enable delta reasoning.
     """
     event_score, rule_score, llm_score, signals, topics, linked_news = _composite_event_score(news_items, news_edges)
     event_text = " | ".join(news["headline"] for news in news_items[:3]) or market["description"]
@@ -701,6 +762,17 @@ def simulate_market(
         result = _simulate_with_llm_agents(
             event_text=event_text,
             event_score=event_score,
+            rule_score=rule_score,
+            topics=topics,
+            signals=signals,
+            agent_count=agent_count,
+            randomness=randomness,
+            seed=seed,
+            market_name=market["name"],
+            market_description=market["description"],
+            market_probability=market["market_probability"],
+            linked_headlines=[news["headline"] for news in news_items],
+            prior_reactions=prior_reactions,
             rule_score=rule_score,
             topics=topics,
             signals=signals,

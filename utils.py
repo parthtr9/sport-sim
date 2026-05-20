@@ -9,6 +9,7 @@ import streamlit as st
 
 DATA_DIR = Path(__file__).parent / "data"
 STATE_FILE = DATA_DIR / "state.json"
+AGENT_MEMORY_DIR = DATA_DIR / "agent_memory"
 
 CATEGORIES = ["macro", "markets", "crypto", "culture", "policy", "company"]
 
@@ -115,3 +116,41 @@ def remove_edge(state: dict, source_id: str, target_id: str) -> None:
         e for e in state["edges"]
         if not (e["source_id"] == source_id and e["target_id"] == target_id)
     ]
+
+
+# ── Agent memory persistence (cross-event) ────────────────────────────────
+
+def save_agent_reactions(market_id: str, reactions: list[dict[str, Any]]) -> None:
+    """Save agent reactions to JSON for reuse across news events.
+    
+    Enables delta-reasoning: next news event can pass these prior reactions
+    as context, avoiding full re-evaluation and reducing LLM token usage.
+    """
+    AGENT_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    memory_file = AGENT_MEMORY_DIR / f"{market_id}_reactions.json"
+    memory_file.write_text(
+        json.dumps(reactions, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def load_agent_reactions(market_id: str) -> list[dict[str, Any]] | None:
+    """Load previously saved agent reactions for a market."""
+    memory_file = AGENT_MEMORY_DIR / f"{market_id}_reactions.json"
+    if memory_file.exists():
+        return json.loads(memory_file.read_text(encoding="utf-8"))
+    return None
+
+
+def clear_agent_reactions(market_id: str) -> None:
+    """Clear saved reactions for a market (e.g., when resetting simulation)."""
+    memory_file = AGENT_MEMORY_DIR / f"{market_id}_reactions.json"
+    if memory_file.exists():
+        memory_file.unlink()
+
+
+def clear_all_agent_memory() -> None:
+    """Clear all agent memory across all markets."""
+    if AGENT_MEMORY_DIR.exists():
+        import shutil
+        shutil.rmtree(AGENT_MEMORY_DIR)
